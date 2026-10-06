@@ -285,10 +285,11 @@ namespace ChainedProxyFuse
         static readonly string[] Urls = { "http://api.ipify.org", "http://ipv4.icanhazip.com", "http://ifconfig.me/ip" };
         static string Url() { return Urls[(n++) % Urls.Length]; }
 
-        // 经代理链（xray 中继端口）看到的出口 IP
+        // 经代理链（xray 中继端口）看到的出口 IP。
+        // 注意不能加 --noproxy *：它会连 --socks5-hostname 一起禁用，curl 就直接出门了。
         public static string ViaRelay(int port, out string err)
         {
-            return Util.ParseIp(Util.Run("curl.exe", "-sS -m 6 --noproxy * --socks5-hostname 127.0.0.1:" + port + " " + Url(), 10000, out err));
+            return Util.ParseIp(Util.Run("curl.exe", "-sS -m 6 --socks5-hostname 127.0.0.1:" + port + " " + Url(), 10000, out err));
         }
         // 不指定代理，走系统路由（也就是浏览器走的那条路）
         public static string ViaSystem()
@@ -302,7 +303,7 @@ namespace ChainedProxyFuse
         }
         public static string Country(int port)
         {
-            var s = Util.Run("curl.exe", "-s -m 6 --noproxy * --socks5-hostname 127.0.0.1:" + port + " \"http://ip-api.com/line/?fields=country\"", 10000);
+            var s = Util.Run("curl.exe", "-s -m 6 --socks5-hostname 127.0.0.1:" + port + " \"http://ip-api.com/line/?fields=country\"", 10000);
             return s == null ? "" : s.Trim();
         }
     }
