@@ -43,6 +43,13 @@ namespace ChainedProxyFuse
         // 运行外部程序，返回标准输出；超时则杀掉
         public static string Run(string file, string args, int timeoutMs)
         {
+            string err;
+            return Run(file, args, timeoutMs, out err);
+        }
+
+        public static string Run(string file, string args, int timeoutMs, out string err)
+        {
+            err = null;
             try
             {
                 var psi = new ProcessStartInfo(file, args)
@@ -54,8 +61,9 @@ namespace ChainedProxyFuse
                 using (var p = Process.Start(psi))
                 {
                     var outTask = p.StandardOutput.ReadToEndAsync();
-                    p.StandardError.ReadToEndAsync();
-                    if (!p.WaitForExit(timeoutMs)) { try { p.Kill(); } catch { } return null; }
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(timeoutMs)) { try { p.Kill(); } catch { } err = "timeout"; return null; }
+                    err = errTask.Result.Trim();
                     return outTask.Result;
                 }
             }
@@ -108,15 +116,22 @@ namespace ChainedProxyFuse
 
         public static bool V2rayNRunning() { return Process.GetProcessesByName("v2rayN").Length > 0; }
 
-        // xray 的本地 SOCKS 中继端口；找不到返回 0
+        static int Port(string endpoint) { return int.Parse(endpoint.Substring(endpoint.LastIndexOf(':') + 1)); }
+
+        // 主 xray 的本地 SOCKS 中继端口；找不到返回 0。
+        // v2rayN 测速时会临时多开几个 xray，所以优先选 sing-box 正连着的那个端口。
         public static int RelayPort()
         {
             var xray = Pids("xray");
             if (xray.Count == 0) return 0;
-            foreach (var c in Netstat())
-                if (c.State == "LISTENING" && xray.Contains(c.Pid) && c.Local.StartsWith("127.0.0.1:"))
-                    return int.Parse(c.Local.Substring(c.Local.LastIndexOf(':') + 1));
-            return 0;
+            var sb = Pids("sing-box");
+            var conns = Netstat();
+            var listening = conns.Where(c => c.State == "LISTENING" && xray.Contains(c.Pid) && c.Local.StartsWith("127.0.0.1:"))
+                                 .Select(c => Port(c.Local)).ToList();
+            foreach (var c in conns)
+                if (c.State == "ESTABLISHED" && sb.Contains(c.Pid) && c.Remote.StartsWith("127.0.0.1:") && listening.Contains(Port(c.Remote)))
+                    return Port(c.Remote);
+            return listening.Count > 0 ? listening[0] : 0;
         }
 
         // sing-box 正在直连的公网地址（马来西亚服务器等）
@@ -212,15 +227,17 @@ namespace ChainedProxyFuse
             RemoveAll();
             string remote = RemoteBlocked(s.AllowIps);
             string tun = Live.TunName(s.TunName);
-            var ifaces = new List<string>();
+            var ifaces = new List<string>();   // 真实网卡（门禁）
+            var all = new List<string>();      // 真实网卡 + 虚拟网卡（总闸），不含本机回环，免得把检测用的 127.0.0.1 也封掉
             foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
             {
                 if (n.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                all.Add(n.Name);
                 if (n.Name == tun || n.Description.IndexOf("sing-tun", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                 ifaces.Add(n.Name);
             }
             Add(LockName, remote, ifaces.Count > 0 ? ifaces.ToArray() : null, true);
-            Add(TripName, remote, null, trip);
+            Add(TripName, remote, all.Count > 0 ? all.ToArray() : null, trip);
             Util.Log("防火墙规则已刷新。放行 IP: " + string.Join(",", s.AllowIps) + "；受限网卡: " + string.Join(",", ifaces));
         }
 
@@ -251,8 +268,9 @@ namespace ChainedProxyFuse
                 if ((long)r[1] + 1 > cursor) cursor = (long)r[1] + 1;
             }
             if (cursor <= uint.MaxValue) parts.Add(Range(cursor, uint.MaxValue));
-            // IPv6：只放行 ::1、fc00::/7、fe80::/10、ff00::/8，其余公网 IPv6 全封
-            parts.Add("::2-fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
+            // IPv6：只放行 ::1、::ffff:0:0/96（IPv4 映射地址，由上面的 IPv4 规则管）、fc00::/7、fe80::/10、ff00::/8，其余公网 IPv6 全封
+            parts.Add("0:0:0:0:0:0:0:2-0:0:0:0:0:fffe:ffff:ffff");
+            parts.Add("0:0:0:0:1:0:0:0-fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
             parts.Add("fe00::-fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
             parts.Add("fec0::-feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
             return string.Join(",", parts);
@@ -268,9 +286,9 @@ namespace ChainedProxyFuse
         static string Url() { return Urls[(n++) % Urls.Length]; }
 
         // 经代理链（xray 中继端口）看到的出口 IP
-        public static string ViaRelay(int port)
+        public static string ViaRelay(int port, out string err)
         {
-            return Util.ParseIp(Util.Run("curl.exe", "-s -m 6 --noproxy * --socks5-hostname 127.0.0.1:" + port + " " + Url(), 10000));
+            return Util.ParseIp(Util.Run("curl.exe", "-sS -m 6 --noproxy * --socks5-hostname 127.0.0.1:" + port + " " + Url(), 10000, out err));
         }
         // 不指定代理，走系统路由（也就是浏览器走的那条路）
         public static string ViaSystem()
@@ -505,10 +523,11 @@ namespace ChainedProxyFuse
             // 断网时也要学：v2rayN 重启后 sing-box 可能连到前置服务器的另一个 IP，不放行就永远检测不到恢复
             if (port != 0) Learn();
 
-            string ip = port == 0 ? null : Probe.ViaRelay(port);
+            string err = null;
+            string ip = port == 0 ? null : Probe.ViaRelay(port, out err);
             if (st != St.Ok)
             {
-                string line = "检测(" + st + ") 中继端口=" + port + " 结果=" + (ip ?? "失败");
+                string line = "检测(" + st + ") 中继端口=" + port + " 结果=" + (ip ?? "失败 " + err);
                 if (line != lastProbeLog) { Util.Log(line); lastProbeLog = line; }
             }
 
