@@ -1,0 +1,7 @@
+# Runtime files — contain your real exit / server IPs, never commit
+fuse-config.json
+fuse.log
+
+# Build output
+*.exe
+*.pdb
