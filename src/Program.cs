@@ -22,6 +22,8 @@ namespace ChainedProxyFuse
         public string TunName = "singbox_tun";
         public int IntervalSec = 5;
         public int FailLimit = 2;
+        public bool BypassUU = true;                         // UU 远程不受门禁/总闸限制（会用真实 IP 直连）
+        public List<string> BypassApps = new List<string>(); // 其它不受限制的程序（完整路径）
     }
 
     static class Util
@@ -158,6 +160,31 @@ namespace ChainedProxyFuse
             return fallback;
         }
 
+        // 不受门禁/总闸限制的程序：UU 远程（从它的服务注册表找安装目录）+ 用户手动加的
+        public static List<string> BypassExes(Settings s)
+        {
+            var res = new List<string>();
+            if (s.BypassUU)
+            {
+                try
+                {
+                    using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\GameViewerService"))
+                    {
+                        var m = Regex.Match(Convert.ToString(k == null ? null : k.GetValue("ImagePath")) ?? "", "^\\s*\"?([^\"]+?\\.exe)", RegexOptions.IgnoreCase);
+                        if (m.Success)
+                        {
+                            var dir = Path.GetDirectoryName(m.Groups[1].Value);
+                            foreach (var d in new[] { dir, Path.Combine(dir, "bin") })
+                                if (Directory.Exists(d)) res.AddRange(Directory.GetFiles(d, "GameViewer*.exe"));
+                        }
+                    }
+                }
+                catch { }
+            }
+            foreach (var p in s.BypassApps) if (File.Exists(p) && !res.Contains(p)) res.Add(p);
+            return res;
+        }
+
         public static string RealIfaceIp(string tun)
         {
             foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
@@ -171,11 +198,12 @@ namespace ChainedProxyFuse
         }
     }
 
-    // ---------- Windows 防火墙 ----------
+    // ---------- Windows 防火墙（门禁）+ WFP（总闸、放行名单，见 Wfp.cs） ----------
     static class Fw
     {
         const string Grp = "ChainedProxyFuse";
-        public const string LockName = "CPF-Lock", TripName = "CPF-Trip";
+        public const string LockName = "CPF-Lock";
+        const string LegacyTripName = "CPF-Trip";   // 旧版本的总闸是防火墙规则
 
         static dynamic Pol() { return Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2")); }
 
@@ -185,7 +213,7 @@ namespace ChainedProxyFuse
             catch { return false; }
         }
 
-        public static void RemoveAll()
+        static void RemoveFwRules()
         {
             dynamic p = Pol();
             var names = new List<string>();
@@ -194,9 +222,16 @@ namespace ChainedProxyFuse
             foreach (var n in names) p.Rules.Remove(n);
         }
 
+        public static void RemoveAll()
+        {
+            RemoveFwRules();
+            Wfp.RemoveAll();
+        }
+
         public static bool TripEnabled()
         {
-            try { dynamic p = Pol(); return (bool)p.Rules.Item(TripName).Enabled; } catch { return false; }
+            if (Wfp.TripOn()) return true;
+            try { dynamic p = Pol(); return (bool)p.Rules.Item(LegacyTripName).Enabled; } catch { return false; }
         }
 
         public static bool Exists(string name)
@@ -204,41 +239,36 @@ namespace ChainedProxyFuse
             try { dynamic p = Pol(); var r = p.Rules.Item(name); return r != null; } catch { return false; }
         }
 
-        public static void SetTrip(bool on)
-        {
-            dynamic p = Pol();
-            p.Rules.Item(TripName).Enabled = on;
-        }
+        public static void SetTrip(Settings s, bool on) { Wfp.SetTrip(on, s.AllowIps); }
 
-        static void Add(string name, string remote, string[] ifaces, bool enabled)
+        static void Add(string name, string remote, string[] ifaces)
         {
             dynamic r = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FWRule"));
             r.Name = name; r.Grouping = Grp; r.Direction = 2; r.Action = 0; r.Protocol = 256;
             r.Profiles = 0x7FFFFFFF; r.RemoteAddresses = remote;
             if (ifaces != null) r.Interfaces = ifaces.Cast<object>().ToArray();
-            r.Enabled = enabled;
+            r.Enabled = true;
             Pol().Rules.Add(r);
         }
 
-        // 建立/刷新两条规则；保留“总闸”当前的开关状态
+        // 建立/刷新门禁和放行名单；保留“总闸”当前的开关状态（白名单变了总闸也要重建）
         public static void Build(Settings s)
         {
             bool trip = TripEnabled();
-            RemoveAll();
-            string remote = RemoteBlocked(s.AllowIps);
+            RemoveFwRules();
             string tun = Live.TunName(s.TunName);
             var ifaces = new List<string>();   // 真实网卡（门禁）
-            var all = new List<string>();      // 真实网卡 + 虚拟网卡（总闸），不含本机回环，免得把检测用的 127.0.0.1 也封掉
             foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
             {
                 if (n.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-                all.Add(n.Name);
                 if (n.Name == tun || n.Description.IndexOf("sing-tun", StringComparison.OrdinalIgnoreCase) >= 0) continue;
                 ifaces.Add(n.Name);
             }
-            Add(LockName, remote, ifaces.Count > 0 ? ifaces.ToArray() : null, true);
-            Add(TripName, remote, all.Count > 0 ? all.ToArray() : null, trip);
-            Util.Log("防火墙规则已刷新。放行 IP: " + string.Join(",", s.AllowIps) + "；受限网卡: " + string.Join(",", ifaces));
+            Add(LockName, RemoteBlocked(s.AllowIps), ifaces.Count > 0 ? ifaces.ToArray() : null);
+            var bypass = Live.BypassExes(s);
+            Wfp.Apply(bypass, trip, s.AllowIps);
+            Util.Log("防火墙规则已刷新。放行 IP: " + string.Join(",", s.AllowIps) + "；受限网卡: " + string.Join(",", ifaces) +
+                     "；不受限程序: " + (bypass.Count == 0 ? "无" : string.Join(",", bypass.Select(Path.GetFileName).Distinct())));
         }
 
         static uint ToU(string s)
@@ -248,8 +278,25 @@ namespace ChainedProxyFuse
         }
         static string FromU(long u) { return ((u >> 24) & 255) + "." + ((u >> 16) & 255) + "." + ((u >> 8) & 255) + "." + (u & 255); }
 
-        // “全部地址 减去 白名单”，用区间表示（防火墙规则要的是要封的地址）
+        // IPv6：只放行 ::1、::ffff:0:0/96（IPv4 映射地址，由 IPv4 规则管）、fc00::/7、fe80::/10、ff00::/8，其余公网 IPv6 全封
+        public static readonly string[][] BlockedV6 =
+        {
+            new[] { "0:0:0:0:0:0:0:2", "0:0:0:0:0:fffe:ffff:ffff" },
+            new[] { "0:0:0:0:1:0:0:0", "fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" },
+            new[] { "fe00::", "fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff" },
+            new[] { "fec0::", "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff" },
+        };
+
+        // 防火墙规则要的是要封的地址：用区间表示“全部地址 减去 白名单”
         static string RemoteBlocked(IEnumerable<string> ips)
+        {
+            var parts = BlockedV4(ips).Select(r => Range(r[0], r[1])).ToList();
+            parts.AddRange(BlockedV6.Select(r => r[0] + "-" + r[1]));
+            return string.Join(",", parts);
+        }
+
+        // “全部 IPv4 减去 局域网/阿里 DNS/白名单”，返回 [起, 止] 区间
+        public static List<uint[]> BlockedV4(IEnumerable<string> ips)
         {
             var allow = new List<uint[]>();
             Action<string, string> a = (s, e) => allow.Add(new[] { ToU(s), ToU(e) });
@@ -260,20 +307,15 @@ namespace ChainedProxyFuse
             foreach (var ip in ips) { IPAddress x; if (IPAddress.TryParse(ip, out x) && x.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) a(ip, ip); }
             allow.Sort((p, q) => p[0].CompareTo(q[0]));
 
-            var parts = new List<string>();
+            var res = new List<uint[]>();
             long cursor = 0;
             foreach (var r in allow)
             {
-                if (r[0] > cursor) parts.Add(Range(cursor, r[0] - 1));
+                if (r[0] > cursor) res.Add(new[] { (uint)cursor, r[0] - 1 });
                 if ((long)r[1] + 1 > cursor) cursor = (long)r[1] + 1;
             }
-            if (cursor <= uint.MaxValue) parts.Add(Range(cursor, uint.MaxValue));
-            // IPv6：只放行 ::1、::ffff:0:0/96（IPv4 映射地址，由上面的 IPv4 规则管）、fc00::/7、fe80::/10、ff00::/8，其余公网 IPv6 全封
-            parts.Add("0:0:0:0:0:0:0:2-0:0:0:0:0:fffe:ffff:ffff");
-            parts.Add("0:0:0:0:1:0:0:0-fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
-            parts.Add("fe00::-fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
-            parts.Add("fec0::-feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
-            return string.Join(",", parts);
+            if (cursor <= uint.MaxValue) res.Add(new[] { (uint)cursor, uint.MaxValue });
+            return res;
         }
         static string Range(long s, long e) { return s == e ? FromU(s) : FromU(s) + "-" + FromU(e); }
     }
@@ -436,7 +478,7 @@ namespace ChainedProxyFuse
         // ---------- 动作 ----------
         void Trip(string why)
         {
-            try { lock (fwLock) { if (!Fw.Exists(Fw.TripName)) Fw.Build(S); Fw.SetTrip(true); } }
+            try { lock (fwLock) { if (!Fw.Exists(Fw.LockName)) Fw.Build(S); Fw.SetTrip(S, true); } }
             catch (Exception ex) { Util.Log("拉闸失败: " + ex.Message); }
             recoverReady = false; goodStreak = 0;
             SetState(St.Tripped, why);
@@ -446,7 +488,7 @@ namespace ChainedProxyFuse
 
         void Recover()
         {
-            try { lock (fwLock) Fw.SetTrip(false); } catch (Exception ex) { Util.Log("恢复失败: " + ex.Message); return; }
+            try { lock (fwLock) Fw.SetTrip(S, false); } catch (Exception ex) { Util.Log("恢复失败: " + ex.Message); return; }
             recoverReady = false; fails = 0; goodStreak = 0;
             SetState(St.Ok, "手动恢复");
             Util.Log("用户点击恢复上网");
@@ -596,8 +638,14 @@ namespace ChainedProxyFuse
     static class Program
     {
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
+            // 紧急恢复脚本调用：撤掉所有规则（含 WFP）后退出
+            if (args.Length > 0 && args[0].Equals("/cleanup", StringComparison.OrdinalIgnoreCase))
+            {
+                try { Fw.RemoveAll(); Util.Log("紧急恢复：规则已全部撤销"); } catch (Exception ex) { Util.Log("紧急恢复失败: " + ex.Message); }
+                return;
+            }
             bool created;
             using (var m = new Mutex(true, "ChainedProxyFuse.Single", out created))
             {

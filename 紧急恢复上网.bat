@@ -7,8 +7,10 @@ if errorlevel 1 (
   exit /b
 )
 taskkill /f /im ChainedProxyFuse.exe >nul 2>&1
+rem Remove the WFP trip/bypass filters (new versions keep them outside the firewall).
+if exist "%~dp0ChainedProxyFuse.exe" start "" /wait "%~dp0ChainedProxyFuse.exe" /cleanup
 netsh advfirewall firewall delete rule name=CPF-Lock
-netsh advfirewall firewall delete rule name=CPF-Trip
+netsh advfirewall firewall delete rule name=CPF-Trip >nul 2>&1
 echo.
 echo Done. All Chained-Proxy-Fuse rules removed, network is back to normal.
 pause
