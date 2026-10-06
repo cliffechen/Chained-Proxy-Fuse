@@ -308,6 +308,7 @@ namespace ChainedProxyFuse
         string reason = "";
         int fails, goodStreak, relayMissing;
         bool recoverReady, askedFirstRun;
+        string lastProbeLog;
         System.Threading.Timer netDebounce;
 
         public Tray()
@@ -501,9 +502,15 @@ namespace ChainedProxyFuse
         {
             if (st == St.Paused) return;
             int port = Live.RelayPort();
-            if (st != St.Tripped && port != 0) Learn();
+            // 断网时也要学：v2rayN 重启后 sing-box 可能连到前置服务器的另一个 IP，不放行就永远检测不到恢复
+            if (port != 0) Learn();
 
             string ip = port == 0 ? null : Probe.ViaRelay(port);
+            if (st != St.Ok)
+            {
+                string line = "检测(" + st + ") 中继端口=" + port + " 结果=" + (ip ?? "失败");
+                if (line != lastProbeLog) { Util.Log(line); lastProbeLog = line; }
+            }
 
             if (port == 0) { relayMissing++; if (st != St.Tripped) reason = Live.V2rayNRunning() ? "v2rayN 在运行，但没找到代理链" : "v2rayN 没运行"; }
             else relayMissing = 0;
@@ -524,6 +531,7 @@ namespace ChainedProxyFuse
                     if (goodStreak >= 3 && !recoverReady)
                     {
                         recoverReady = true; RefreshUi();
+                        Util.Log("日本 IP 已连续 3 次检测正常，等待用户点“恢复上网”");
                         Balloon("日本 IP 已恢复", "已稳定约 15 秒。右键托盘图标点“恢复上网”。", ToolTipIcon.Info);
                     }
                     return;
