@@ -6,6 +6,9 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -371,6 +374,8 @@ namespace ChainedProxyFuse
         bool recoverReady, askedFirstRun;
         string lastProbeLog;
         System.Threading.Timer netDebounce;
+        readonly System.Windows.Forms.Timer iconTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+        bool iconLost;
 
         public Tray()
         {
@@ -394,6 +399,7 @@ namespace ChainedProxyFuse
             ni.ContextMenuStrip = menu; ni.Visible = true;
             ni.DoubleClick += (o, e) => ni.ShowBalloonTip(4000, "链式代理保险丝", miStatus.Text, ToolTipIcon.Info);
             menu.Opening += (o, e) => { miAuto.Checked = AutoOn(); RefreshUi(); };
+            iconTimer.Tick += (o, e) => EnsureIcon(); iconTimer.Start();
 
             // 启动：建立门禁；若上次是“已断网”则保持断网
             try
@@ -403,6 +409,7 @@ namespace ChainedProxyFuse
             }
             catch (Exception ex) { Util.Log("建立门禁失败: " + ex.Message); st = St.Waiting; reason = "建立防火墙规则失败: " + ex.Message; }
             RefreshUi();
+            ThreadPool.QueueUserWorkItem(_ => FixTask(TaskName));
 
             NetworkChange.NetworkAddressChanged += (o, e) => { if (netDebounce != null) netDebounce.Dispose(); netDebounce = new System.Threading.Timer(_ => { if (st != St.Paused) SafeBuild(); }, null, 2000, Timeout.Infinite); };
             var t = new Thread(Loop) { IsBackground = true }; t.Start();
@@ -467,8 +474,30 @@ namespace ChainedProxyFuse
                 return ic;
             }
         }
-        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr h);
+        [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr h);
         static void NativeDestroy(IntPtr h) { DestroyIcon(h); }
+
+        // 开机自启时本工具可能比任务栏先起来，或者 explorer 中途重启过，图标就没加上去
+        // （WinForms 不检查 Shell_NotifyIcon 的返回值），程序在后台照常保护，却没有图标、点 exe 也没反应。
+        // 所以定时用一个空的“修改”问任务栏这个图标在不在，不在就重新加。
+        [StructLayout(LayoutKind.Explicit, Size = 976)]   // NOTIFYICONDATAW（x64），只用到前三个字段
+        struct IconData { [FieldOffset(0)] public int size; [FieldOffset(8)] public IntPtr hwnd; [FieldOffset(16)] public int id; }
+        [DllImport("shell32.dll")] static extern bool Shell_NotifyIconW(int msg, ref IconData d);
+        const int NIM_MODIFY = 1;
+        // NotifyIcon 不公开它的窗口句柄和图标 ID，只能反射拿
+        static readonly FieldInfo NiWindow = typeof(NotifyIcon).GetField("window", BindingFlags.Instance | BindingFlags.NonPublic),
+                                  NiId = typeof(NotifyIcon).GetField("id", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        void EnsureIcon()
+        {
+            if (quitting || ni.Icon == null || NiWindow == null || NiId == null) return;
+            var w = NiWindow.GetValue(ni) as NativeWindow;
+            if (w == null || w.Handle == IntPtr.Zero) return;
+            var d = new IconData { size = Marshal.SizeOf(typeof(IconData)), hwnd = w.Handle, id = (int)NiId.GetValue(ni) };
+            if (Shell_NotifyIconW(NIM_MODIFY, ref d)) { iconLost = false; return; }
+            if (!iconLost) { iconLost = true; Util.Log("托盘图标不在任务栏上，重新添加"); }
+            ni.Visible = false; ni.Visible = true;
+        }
 
         void Balloon(string title, string text, ToolTipIcon icon)
         {
@@ -514,11 +543,49 @@ namespace ChainedProxyFuse
         }
 
         const string TaskName = "ChainedProxyFuse";
-        bool AutoOn() { return Util.Run("schtasks.exe", "/Query /TN " + TaskName, 8000) != null && Util.Run("schtasks.exe", "/Query /TN " + TaskName, 8000).Contains(TaskName); }
+        static bool AutoOn() { return Util.Run("schtasks.exe", "/Query /TN " + TaskName, 8000) != null && Util.Run("schtasks.exe", "/Query /TN " + TaskName, 8000).Contains(TaskName); }
         void ToggleAuto()
         {
             if (AutoOn()) Util.Run("schtasks.exe", "/Delete /TN " + TaskName + " /F", 8000);
-            else Util.Run("schtasks.exe", "/Create /TN " + TaskName + " /TR \"\\\"" + Application.ExecutablePath + "\\\"\" /SC ONLOGON /RL HIGHEST /F", 8000);
+            else { var err = CreateTask(TaskName); if (err != "") Util.Log("设置开机自启失败: " + err); }
+        }
+
+        // schtasks 命令行建的任务带着任务计划的默认值：用电池时不启动、拔掉电源就停、运行 72 小时就停。
+        // 笔记本一拔电源保险丝就没了（门禁和总闸还在，但没人看出口 IP、也不会拉闸），命令行参数又改不了这几项，只能用 XML 建
+        static string TaskXml()
+        {
+            var user = SecurityElement.Escape(System.Security.Principal.WindowsIdentity.GetCurrent().Name);
+            return "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
+                "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId></LogonTrigger></Triggers>" +
+                "<Principals><Principal id=\"Author\"><UserId>" + user + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>" +
+                "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+                "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><Enabled>true</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>" +
+                "<Actions Context=\"Author\"><Exec><Command>\"" + SecurityElement.Escape(Application.ExecutablePath) + "\"</Command></Exec></Actions></Task>";
+        }
+
+        // 建（或覆盖）任务；成功返回 ""，失败返回原因
+        static string CreateTask(string name)
+        {
+            var tmp = Path.Combine(Path.GetTempPath(), "ChainedProxyFuse-task.xml");
+            try
+            {
+                File.WriteAllText(tmp, TaskXml(), Encoding.Unicode);   // 声明的是 UTF-16，文件也得是
+                string err;
+                var o = Util.Run("schtasks.exe", "/Create /XML \"" + tmp + "\" /TN " + name + " /F", 8000, out err);
+                return o == null ? (err ?? "schtasks 运行失败") : err;
+            }
+            catch (Exception ex) { return ex.Message; }
+            finally { try { File.Delete(tmp); } catch { } }
+        }
+
+        // 旧版本建的任务还是那几个默认值：启动时（本程序有管理员权限）发现就照新设置重建
+        static void FixTask(string name)
+        {
+            var xml = Util.Run("schtasks.exe", "/Query /TN " + name + " /XML", 8000);
+            if (xml == null || !xml.Contains("<Task")) return;   // 没设开机自启
+            if (xml.Contains("<DisallowStartIfOnBatteries>false<") && xml.Contains("<StopIfGoingOnBatteries>false<") && xml.Contains("<ExecutionTimeLimit>PT0S<")) return;
+            var err = CreateTask(name);
+            Util.Log(err == "" ? "开机自启任务已更新：用电池也启动、拔电源不停、不限运行时长" : "更新开机自启任务失败: " + err);
         }
 
         void LeakTest(bool show)
@@ -649,9 +716,15 @@ namespace ChainedProxyFuse
             bool created;
             using (var m = new Mutex(true, "ChainedProxyFuse.Single", out created))
             {
-                if (!created) return;
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
+                // 已经有一个在运行（比如开机自启的那个）：要说一声，不能悄悄退出，否则看起来就是“点了没反应”
+                if (!created)
+                {
+                    MessageBox.Show("保险丝已经在运行了。\n\n图标在任务栏右下角；没看到的话，点“^”展开隐藏的图标。",
+                        "链式代理保险丝", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
                 Application.Run(new Tray());
             }
         }
