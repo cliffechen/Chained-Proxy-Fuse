@@ -20,7 +20,7 @@ namespace ChainedProxyFuse
     // ---------- 设置 ----------
     public class Settings
     {
-        public string ExpectedIp = "";                       // 日本静态 IP
+        public string ExpectedIp = "";                       // 落地 IP（首次运行时由用户确认）
         public List<string> AllowIps = new List<string>();   // 允许直连的 IP（马来西亚服务器、直连 DNS）
         public string TunName = "singbox_tun";
         public int IntervalSec = 5;
@@ -376,6 +376,7 @@ namespace ChainedProxyFuse
         System.Threading.Timer netDebounce;
         readonly System.Windows.Forms.Timer iconTimer = new System.Windows.Forms.Timer { Interval = 5000 };
         bool iconLost;
+        int manualCheck;   // 1 = 用户点了“立即检测”，下一轮巡逻结束后要把结果弹出来
 
         public Tray()
         {
@@ -390,9 +391,9 @@ namespace ChainedProxyFuse
             miStatus.Enabled = false;
             menu.Items.Add(miStatus); menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(miRecover); menu.Items.Add(miPause); menu.Items.Add(miResume); menu.Items.Add(new ToolStripSeparator());
-            AddItem(menu, "立即检测", () => kick.Set());
+            AddItem(menu, "立即检测", CheckNow);
             AddItem(menu, "模拟泄漏测试（真实网卡应该出不去）", () => ThreadPool.QueueUserWorkItem(_ => LeakTest(true)));
-            AddItem(menu, "重新识别日本 IP", () => { S.ExpectedIp = ""; askedFirstRun = false; Save(); kick.Set(); });
+            AddItem(menu, "重新识别落地 IP", () => { S.ExpectedIp = ""; askedFirstRun = false; Save(); kick.Set(); });
             AddItem(menu, "打开日志", () => { try { Process.Start("notepad.exe", Path.Combine(Util.Dir, "fuse.log")); } catch { } });
             menu.Items.Add(miAuto); menu.Items.Add(new ToolStripSeparator());
             AddItem(menu, "退出（会解除保护）", Quit);
@@ -437,19 +438,23 @@ namespace ChainedProxyFuse
             st = s; reason = why; RefreshUi();
         }
 
+        string StatusText(out Color c)
+        {
+            switch (st)
+            {
+                case St.Ok: c = Color.LimeGreen; return "正常 · 出口 " + S.ExpectedIp;
+                case St.Tripped: c = Color.Red; return "已断网：" + reason + (recoverReady ? "（落地 IP 已恢复，可点“恢复上网”）" : "");
+                case St.Paused: c = Color.Gray; return "已暂停保护（不受保护）";
+                default: c = Color.Gold; return "等待/检查中：" + reason;
+            }
+        }
+
         void RefreshUi()
         {
             if (quitting) return;
             ui.BeginInvoke((Action)(() =>
             {
-                Color c; string text;
-                switch (st)
-                {
-                    case St.Ok: c = Color.LimeGreen; text = "正常 · 出口 " + S.ExpectedIp; break;
-                    case St.Tripped: c = Color.Red; text = "已断网：" + reason + (recoverReady ? "（日本 IP 已恢复，可点“恢复上网”）" : ""); break;
-                    case St.Paused: c = Color.Gray; text = "已暂停保护（不受保护）"; break;
-                    default: c = Color.Gold; text = "等待/检查中：" + reason; break;
-                }
+                Color c; string text = StatusText(out c);
                 miStatus.Text = text.Length > 120 ? text.Substring(0, 120) : text;
                 ni.Text = ("保险丝 · " + text).Substring(0, Math.Min(60, ("保险丝 · " + text).Length));
                 miRecover.Enabled = st == St.Tripped && recoverReady;
@@ -614,6 +619,15 @@ namespace ChainedProxyFuse
             if (changed) { Save(); SafeBuild(); }
         }
 
+        // 只 kick 一下的话，状态没变就什么都看不到，像是“点了没反应”：先说一声在查，查完把结果弹出来
+        void CheckNow()
+        {
+            if (st == St.Paused) { Balloon("立即检测", "保护已暂停，不会检测。先点“恢复保护”。", ToolTipIcon.Warning); return; }
+            Interlocked.Exchange(ref manualCheck, 1);
+            Balloon("立即检测", "正在检测出口 IP，请稍候…", ToolTipIcon.Info);
+            kick.Set();
+        }
+
         // ---------- 巡逻循环 ----------
         void Loop()
         {
@@ -621,7 +635,16 @@ namespace ChainedProxyFuse
             bool leakChecked = false;
             while (!quitting)
             {
-                try { Tick(ref leakChecked); } catch (Exception ex) { Util.Log("巡逻异常: " + ex.Message); }
+                // 在这一轮开始前取走标记：点击时若正好在巡逻中途，结果留给下一轮（kick 会让它马上开始）
+                bool manual = Interlocked.Exchange(ref manualCheck, 0) == 1;
+                string error = null;
+                try { Tick(ref leakChecked); } catch (Exception ex) { error = ex.Message; Util.Log("巡逻异常: " + ex.Message); }
+                if (manual && !quitting)
+                {
+                    Color c; var text = error != null ? "检测出错：" + error : StatusText(out c);
+                    Util.Log("立即检测: " + text);
+                    Balloon("检测结果", text, st == St.Ok && error == null ? ToolTipIcon.Info : st == St.Tripped || error != null ? ToolTipIcon.Error : ToolTipIcon.Warning);
+                }
                 kick.WaitOne(Math.Max(2, S.IntervalSec) * 1000);
             }
         }
@@ -660,14 +683,14 @@ namespace ChainedProxyFuse
                     if (goodStreak >= 3 && !recoverReady)
                     {
                         recoverReady = true; RefreshUi();
-                        Util.Log("日本 IP 已连续 3 次检测正常，等待用户点“恢复上网”");
-                        Balloon("日本 IP 已恢复", "已稳定约 15 秒。右键托盘图标点“恢复上网”。", ToolTipIcon.Info);
+                        Util.Log("落地 IP 已连续 3 次检测正常，等待用户点“恢复上网”");
+                        Balloon("落地 IP 已恢复", "已稳定约 15 秒。右键托盘图标点“恢复上网”。", ToolTipIcon.Info);
                     }
                     return;
                 }
                 // 正常状态：再看一眼浏览器走的那条路
                 var sys = Probe.ViaSystem();
-                if (sys != null && sys != S.ExpectedIp) { Trip("系统出口 IP 不是日本：" + sys); return; }
+                if (sys != null && sys != S.ExpectedIp) { Trip("系统出口 IP 不是落地 IP：" + sys + "（应为 " + S.ExpectedIp + "）"); return; }
                 SetState(St.Ok, "正常");
                 if (!leakChecked) { leakChecked = true; LeakTest(false); }
             }
@@ -679,7 +702,7 @@ namespace ChainedProxyFuse
             else
             {
                 goodStreak = 0; fails++;
-                if (st == St.Ok && fails >= S.FailLimit) Trip(port == 0 ? "v2rayN/代理链消失" : "日本 IP 不通");
+                if (st == St.Ok && fails >= S.FailLimit) Trip(port == 0 ? "v2rayN/代理链消失" : "落地 IP 不通");
                 else if (st == St.Waiting) SetState(St.Waiting, reason == "" ? "等待代理链" : reason);
             }
         }
@@ -689,11 +712,11 @@ namespace ChainedProxyFuse
             var country = Probe.Country(port);
             ui.BeginInvoke((Action)(() =>
             {
-                var r = MessageBox.Show("当前通过代理链看到的出口 IP 是：\n\n    " + ip + "  " + country + "\n\n这个就是你的日本静态 IP 吗？\n点“是”后，以后这个 IP 一变或不通，就会断网。",
+                var r = MessageBox.Show("当前通过代理链看到的出口 IP 是：\n\n    " + ip + "  " + country + "\n\n这个就是你的落地 IP（代理链最后一跳）吗？\n点“是”后，以后这个 IP 一变或不通，就会断网。",
                     "首次设置", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (r == DialogResult.Yes)
                 {
-                    S.ExpectedIp = ip; Save(); Util.Log("记住日本 IP: " + ip);
+                    S.ExpectedIp = ip; Save(); Util.Log("记住落地 IP: " + ip);
                     if (!AutoOn() && MessageBox.Show("要设置开机自动启动吗？（推荐，否则重启后没有断网保护）", "开机启动", MessageBoxButtons.YesNo) == DialogResult.Yes) ToggleAuto();
                     kick.Set();
                 }
